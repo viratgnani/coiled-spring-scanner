@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Keys & Logs
+aws_key.pem
+*.log
+debug_analysis.txt
+debug_symbols.txt
+
+# Local Setup
+.env
+.vscode/
+.idea/
