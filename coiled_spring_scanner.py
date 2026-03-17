@@ -23,66 +23,14 @@ import ccxt
 import numpy as np
 import pandas as pd
 
-# ==============================================================================
-# CONFIGURATION
-# ==============================================================================
-
-# -- Scan Timing --
-SCAN_INTERVAL_SECONDS    = 5 * 60           # 5 min cycle
-CANDLE_TIMEFRAME         = "1h"
-LOOKBACK_MIN_CANDLES     = 168              # 1 week baseline
-LOOKBACK_MAX_CANDLES     = 720              # 30 day max history
-BREAKOUT_LOOKBACK_HOURS  = 48               # 2-day breakout ceiling
-HEARTBEAT_INTERVAL_HOURS = 12               # Status check
-
-# -- Universe filters --
-MIN_LISTING_AGE_DAYS     = 30              # Catch coins after 1 month
-LISTING_CUTOFF_DATE      = datetime.now(tz=timezone.utc) - timedelta(days=MIN_LISTING_AGE_DAYS)
-
-# Hard blacklist
-BLACKLIST = {
-    "KATUSDT", "COPPERUSDT", "OPNUSDT", "LOBSTERUSDT",
-}
-
-# -- Coiled Detection Thresholds --
-STD_DEV_RETURNS_MAX      = 0.0500          # 5.0% - Allow some volatility
-AVG_BODY_PCT_MAX         = 0.050           # 5.0% - Allow trending
-BB_WIDTH_NEAR_LOW_FACTOR = 10.00          # BB compression factor
-VOLUME_24H_MAX_USD       = 1_000_000_000  # $1B Limit
-AVG_VOL_LOOKBACK         = 48             # Candles for baseline volume
-
-# -- Trigger Thresholds --
-TRIGGER_BODY_MULTIPLE    = 3.0            # Relative body spikes
-TRIGGER_VOL_MULTIPLE     = 3.0            # Relative volume spikes
-TRIGGER_CLOSE_ABOVE_HIGH = True           # Must break lookback high
-
-# Reversal pattern
-ALLOW_DUMP_THEN_PUMP     = True
-DUMP_WICK_MIN_MULTIPLE   = 1.5           # Lower shadow requirement
-
-# -- Indicators --
-EMA_PERIOD               = 15
-
-# -- Output --
-SHOW_MAX_COILED          = 20
-LOG_LEVEL                = logging.INFO
-
-# -- Telegram --
-TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID", "")
-TELEGRAM_ENABLED  = bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)
-
-# -- Rate Limiting --
-OHLCV_DELAY_SECONDS      = 0.25          
-FETCH_RETRY_ATTEMPTS     = 3             
-FETCH_RETRY_DELAY        = 5.0
+import config
 
 # ==============================================================================
 # LOGGING SETUP
 # ==============================================================================
 
 logging.basicConfig(
-    level=LOG_LEVEL,
+    level=config.LOG_LEVEL,
     format="%(asctime)s | %(levelname)-8s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
@@ -98,14 +46,14 @@ log = logging.getLogger("coiled_spring")
 
 def send_telegram(message: str) -> None:
     """Send a Telegram message via Bot API."""
-    if not TELEGRAM_ENABLED:
+    if not config.TELEGRAM_ENABLED:
         return
     try:
         import urllib.request
         import urllib.parse
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        url = f"https://api.telegram.org/bot{config.TELEGRAM_TOKEN}/sendMessage"
         data = urllib.parse.urlencode({
-            "chat_id": TELEGRAM_CHAT_ID,
+            "chat_id": config.TELEGRAM_CHAT_ID,
             "text": message,
             "parse_mode": "HTML",
             "disable_web_page_preview": "true",
@@ -166,13 +114,11 @@ def get_valid_symbols(exchange: ccxt.binanceusdm) -> list:
             continue
 
         base = market.get("base", "")
-        raw_id = market.get("id", "").upper()
-        ticker_key = f"{base}USDT"
-        if ticker_key in BLACKLIST or raw_id in BLACKLIST:
+        listing_dt = listing_date_from_market(market)
+        if ticker_key in config.BLACKLIST or raw_id in config.BLACKLIST:
             continue
 
-        listing_dt = listing_date_from_market(market)
-        if listing_dt and listing_dt > LISTING_CUTOFF_DATE:
+        if listing_dt and listing_dt > config.LISTING_CUTOFF_DATE:
             continue
         
         valid.append(symbol)
@@ -189,13 +135,15 @@ def fetch_ohlcv_safe(
     exchange: ccxt.binanceusdm,
     symbol: str,
     timeframe: str = "1h",
-    limit: int = LOOKBACK_MAX_CANDLES + 5,
+    limit: int = 0,
 ) -> Optional[pd.DataFrame]:
     """Fetch OHLCV candles with retry logic."""
-    for attempt in range(1, FETCH_RETRY_ATTEMPTS + 1):
+    if limit == 0:
+        limit = config.LOOKBACK_MAX_CANDLES + 5
+    for attempt in range(1, config.FETCH_RETRY_ATTEMPTS + 1):
         try:
             raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-            if not raw or len(raw) < LOOKBACK_MIN_CANDLES + 2:
+            if not raw or len(raw) < config.LOOKBACK_MIN_CANDLES + 2:
                 return None
             df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
             df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
@@ -204,9 +152,9 @@ def fetch_ohlcv_safe(
             df = df.sort_values("timestamp").reset_index(drop=True)
             return df
         except ccxt.RateLimitExceeded:
-            time.sleep(FETCH_RETRY_DELAY * attempt)
+            time.sleep(config.FETCH_RETRY_DELAY * attempt)
         except Exception:
-            time.sleep(FETCH_RETRY_DELAY)
+            time.sleep(config.FETCH_RETRY_DELAY)
     return None
 
 # ==============================================================================
@@ -256,10 +204,10 @@ class AnalysisResult:
 
 def analyze_symbol(df: pd.DataFrame, symbol: str) -> AnalysisResult:
     result = AnalysisResult(symbol)
-    if len(df) < LOOKBACK_MIN_CANDLES + 2: return result
+    if len(df) < config.LOOKBACK_MIN_CANDLES + 2: return result
 
     trigger_row = df.iloc[-1]
-    flat_df = df.iloc[-(LOOKBACK_MAX_CANDLES + 1):-1].iloc[-LOOKBACK_MAX_CANDLES:]
+    flat_df = df.iloc[-(config.LOOKBACK_MAX_CANDLES + 1):-1].iloc[-config.LOOKBACK_MAX_CANDLES:]
     
     closes, opens, highs, lows, vols = \
         flat_df["close"].values, flat_df["open"].values, flat_df["high"].values, flat_df["low"].values, flat_df["volume"].values
@@ -267,25 +215,25 @@ def analyze_symbol(df: pd.DataFrame, symbol: str) -> AnalysisResult:
     returns = np.diff(closes) / closes[:-1]
     std_ret = float(np.std(returns, ddof=1))
     result.std_dev_returns = std_ret
-    if std_ret > STD_DEV_RETURNS_MAX: return result
+    if std_ret > config.STD_DEV_RETURNS_MAX: return result
 
     bodies_pct = np.abs(closes - opens) / np.where(opens > 0, opens, 1.0) * 100.0
     avg_body = float(np.mean(bodies_pct))
     result.avg_body_pct = avg_body
-    if avg_body > AVG_BODY_PCT_MAX * 100: return result
+    if avg_body > config.AVG_BODY_PCT_MAX * 100: return result
 
-    avg_close = float(np.mean(closes[-AVG_VOL_LOOKBACK:]))
-    avg_vol_flat = float(np.mean(vols[-AVG_VOL_LOOKBACK:]))
+    avg_close = float(np.mean(closes[-config.AVG_VOL_LOOKBACK:]))
+    avg_vol_flat = float(np.mean(vols[-config.AVG_VOL_LOOKBACK:]))
     avg_vol_usd = avg_vol_flat * avg_close
     result.avg_volume_usd = avg_vol_usd
-    if avg_vol_usd * 24 > VOLUME_24H_MAX_USD: return result
+    if avg_vol_usd * 24 > config.VOLUME_24H_MAX_USD: return result
 
     result.is_coiled = True
     result.flat_candles = len(flat_df)
-    result.flat_high = float(np.max(df.iloc[-(BREAKOUT_LOOKBACK_HOURS + 1):-1]["high"].values))
+    result.flat_high = float(np.max(df.iloc[-(config.BREAKOUT_LOOKBACK_HOURS + 1):-1]["high"].values))
     result.flat_low = float(np.min(lows))
     result.last_close = float(trigger_row["close"])
-    result.ema15 = float(ema(df["close"].values, EMA_PERIOD)[-1])
+    result.ema15 = float(ema(df["close"].values, config.EMA_PERIOD)[-1])
 
     t_open, t_close, t_vol = float(trigger_row["open"]), float(trigger_row["close"]), float(trigger_row["volume"])
     t_vol_usd = t_vol * t_close
@@ -295,16 +243,16 @@ def analyze_symbol(df: pd.DataFrame, symbol: str) -> AnalysisResult:
     result.trigger_vol_multiple = t_vol_usd / avg_vol_usd if avg_vol_usd > 0 else 0.0
     result.trigger_close_pct_above_high = (t_close - result.flat_high) / result.flat_high * 100.0
 
-    body_ok = result.trigger_body_multiple >= TRIGGER_BODY_MULTIPLE
-    vol_ok = result.trigger_vol_multiple >= TRIGGER_VOL_MULTIPLE
-    high_ok = (not TRIGGER_CLOSE_ABOVE_HIGH) or (t_close > result.flat_high)
+    body_ok = result.trigger_body_multiple >= config.TRIGGER_BODY_MULTIPLE
+    vol_ok = result.trigger_vol_multiple >= config.TRIGGER_VOL_MULTIPLE
+    high_ok = (not config.TRIGGER_CLOSE_ABOVE_HIGH) or (t_close > result.flat_high)
 
     if (t_close > t_open) and body_ok and vol_ok and high_ok:
         result.triggered = True
-    elif ALLOW_DUMP_THEN_PUMP:
+    elif config.ALLOW_DUMP_THEN_PUMP:
         prev = flat_df.iloc[-1]
         p_o, p_c, p_l = float(prev["open"]), float(prev["close"]), float(prev["low"])
-        if abs(p_c - p_o) > 0 and (min(p_o, p_c) - p_l) / abs(p_c - p_o) >= DUMP_WICK_MIN_MULTIPLE:
+        if abs(p_c - p_o) > 0 and (min(p_o, p_c) - p_l) / abs(p_c - p_o) >= config.DUMP_WICK_MIN_MULTIPLE:
             if t_close > t_open and vol_ok and body_ok:
                 result.triggered, result.is_dump_then_pump = True, True
 
@@ -321,8 +269,8 @@ def run_forever():
     while True:
         now = time.time()
         try:
-            if (now - last_heartbeat) > (HEARTBEAT_INTERVAL_HOURS * 3600):
-                send_telegram(f"🛰️ <b>Sniper Heartbeat</b>\nStatus: Online\nCycle: {SCAN_INTERVAL_SECONDS/60:.1f}m")
+            if (now - last_heartbeat) > (config.HEARTBEAT_INTERVAL_HOURS * 3600):
+                send_telegram(f"🛰️ <b>Sniper Heartbeat</b>\nStatus: Online\nCycle: {config.SCAN_INTERVAL_SECONDS/60:.1f}m")
                 last_heartbeat = now
 
             if exchange is None or (now - last_market_reload) > 21600:
@@ -343,10 +291,10 @@ def run_forever():
                         send_telegram(f"🚨 <b>{symbol} TRIGGER</b>\nPrice: {res.last_close}\nVol: {res.trigger_vol_multiple:.1f}x")
                     elif res.is_coiled:
                         coiled.append(res)
-                time.sleep(OHLCV_DELAY_SECONDS)
+                time.sleep(config.OHLCV_DELAY_SECONDS)
 
             log.info(f"Scan complete. {len(coiled)} coiled, {len(triggered)} triggered.")
-            time.sleep(max(0, SCAN_INTERVAL_SECONDS - (time.time() - now)))
+            time.sleep(max(0, config.SCAN_INTERVAL_SECONDS - (time.time() - now)))
 
         except Exception as e:
             log.error(f"Loop Error: {e}")
