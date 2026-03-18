@@ -114,6 +114,8 @@ def get_valid_symbols(exchange: ccxt.binanceusdm) -> list:
             continue
 
         base = market.get("base", "")
+        raw_id = market.get("id", "").upper()
+        ticker_key = f"{base}USDT"
         listing_dt = listing_date_from_market(market)
         if ticker_key in config.BLACKLIST or raw_id in config.BLACKLIST:
             continue
